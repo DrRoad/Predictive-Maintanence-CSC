@@ -7,11 +7,13 @@ install.packages("data.table")
 install.packages("zoo")
 install.packages("data.table")
 install.packages("scales")
+install.packages('gbm')
 library(dplyr)
 library(zoo)
 library(ggplot2)
 library(data.table)
 library(scales)
+library(gbm)
 
 #Load the telemetry data set and EDA on it
 
@@ -321,3 +323,252 @@ finalfeat <- finalfeat %>%
 
 head(finalfeat, 10)
 cat("The final set of features are:",paste0(names(finalfeat), ","))
+# left join final features with failures on machineID then mutate a column for datetime difference
+# filter date difference for the prediction horizon which is 24 hours
+
+labeled <- left_join(finalfeat, failures, by = c("machineID")) %>%
+  mutate(datediff = difftime(datetime.y, datetime.x, units = "hours")) %>%
+  filter(datediff <= 24, datediff >= 0)
+
+# left join labels to final features and fill NA's with "none" indicating no failure
+
+labeledfeatures <- left_join(finalfeat, 
+                             labeled %>% select(datetime.x, machineID, failure),
+                             by = c("datetime" = "datetime.x", "machineID")) %>%
+  arrange(machineID,datetime)
+
+levels(labeledfeatures$failure) <- c(levels(labeledfeatures$failure), "none")
+labeledfeatures$failure[is.na(labeledfeatures$failure)]<-"none"
+head(labeledfeatures)
+
+# split at 2015-08-01 01:00:00, to train on the first 8 months and test on last 4 months
+# labelling window is 24 hours so records within 24 hours prior to split point are left out
+
+trainingdata1 <- labeledfeatures[labeledfeatures$datetime < "2015-07-31 01:00:00",] 
+testingdata1 <- labeledfeatures[labeledfeatures$datetime > "2015-08-01 01:00:00",]
+
+tail(trainingdata1)
+head(testingdata1)
+
+# split at 2015-09-01 01:00:00, to train on the first 9 months and test on last 3 months
+# labelling window is 24 hours so records within 24 hours prior to split point are left out
+
+trainingdata2 <- labeledfeatures[labeledfeatures$datetime < "2015-08-31 01:00:00",] 
+testingdata2 <- labeledfeatures[labeledfeatures$datetime > "2015-09-01 01:00:00",]
+
+tail(trainingdata2)
+head(testingdata2)
+
+# split at 2015-10-01 01:00:00, to train on the first 10 months and test on last 2 months
+# labelling window is 24 hours so records within 24 hours prior to split point are left out
+
+trainingdata3 <- labeledfeatures[labeledfeatures$datetime < "2015-09-30 01:00:00",] 
+testingdata3 <- labeledfeatures[labeledfeatures$datetime > "2015-10-01 01:00:00",]
+
+tail(trainingdata3)
+head(testingdata3)
+
+# create the training formula
+
+trainformula <- as.formula(paste('failure',paste(names(labeledfeatures)[c(3:29)],collapse=' + '),sep=' ~ '))
+trainformula
+
+# train model on 3 splits
+trainingdata1$model <- as.factor(trainingdata1$model)
+trainingdata2$model <- as.factor(trainingdata2$model)
+trainingdata3$model <- as.factor(trainingdata3$model)
+testingdata1$model <- as.factor(testingdata1$model)
+testingdata2$model <- as.factor(testingdata2$model)
+testingdata3$model <- as.factor(testingdata3$model)
+set.seed(123)
+gbm_model1 <- gbm(formula = trainformula, data = trainingdata1, 
+                  distribution = "multinomial", n.trees = 50,
+                  interaction.depth = 5, shrinkage = 0.1)
+gbm_model2 <- gbm(formula = trainformula, data = trainingdata2, 
+                  distribution = "multinomial", n.trees = 50,
+                  interaction.depth = 5, shrinkage = 0.1)
+gbm_model3 <- gbm(formula = trainformula, data = trainingdata3,
+                  distribution = "multinomial", n.trees = 50,
+                  interaction.depth = 5, shrinkage = 0.1)
+
+# print relative influence of variables for models
+
+summary(gbm_model1)
+summary(gbm_model2)
+summary(gbm_model3)
+
+# label distribution after features are labeled - the class imbalance problem
+
+ggplot(labeledfeatures, aes(x=failure)) + 
+  geom_bar(fill="red") + 
+  labs(title = "label distribution", x = "labels")
+
+# define evaluate function.Evaluate function has been taken from this source.
+#http://blog.revolutionanalytics.com/2016/03/com_class_eval_metrics_r.html#imb
+#Citation : Said Bleik, Shaheen Gauher
+
+Evaluate<-function(actual=NULL, predicted=NULL, cm=NULL){
+  if(is.null(cm)) {
+    actual = actual[!is.na(actual)]
+    predicted = predicted[!is.na(predicted)]
+    f = factor(union(unique(actual), unique(predicted)))
+    actual = factor(actual, levels = levels(f))
+    predicted = factor(predicted, levels = levels(f))
+    cm = as.matrix(table(Actual=actual, Predicted=predicted))
+  }
+  
+  n = sum(cm) # number of instances
+  nc = nrow(cm) # number of classes
+  diag = diag(cm) # number of correctly classified instances per class 
+  rowsums = apply(cm, 1, sum) # number of instances per class
+  colsums = apply(cm, 2, sum) # number of predictions per class
+  p = rowsums / n # distribution of instances over the classes
+  q = colsums / n # distribution of instances over the predicted classes
+  
+  #accuracy
+  accuracy = sum(diag) / n
+  
+  #per class
+  recall = diag / rowsums
+  precision = diag / colsums
+  f1 = 2 * precision * recall / (precision + recall)
+  
+  #macro
+  macroPrecision = mean(precision)
+  macroRecall = mean(recall)
+  macroF1 = mean(f1)
+  
+  #1-vs-all matrix
+  oneVsAll = lapply(1 : nc,
+                    function(i){
+                      v = c(cm[i,i],
+                            rowsums[i] - cm[i,i],
+                            colsums[i] - cm[i,i],
+                            n-rowsums[i] - colsums[i] + cm[i,i]);
+                      return(matrix(v, nrow = 2, byrow = T))})
+  
+  s = matrix(0, nrow=2, ncol=2)
+  for(i in 1:nc){s=s+oneVsAll[[i]]}
+  
+  #avg accuracy
+  avgAccuracy = sum(diag(s))/sum(s)
+  
+  #micro
+  microPrf = (diag(s) / apply(s,1, sum))[1];
+  
+  #majority class
+  mcIndex = which(rowsums==max(rowsums))[1] # majority-class index
+  mcAccuracy = as.numeric(p[mcIndex]) 
+  mcRecall = 0*p;  mcRecall[mcIndex] = 1
+  mcPrecision = 0*p; mcPrecision[mcIndex] = p[mcIndex]
+  mcF1 = 0*p; mcF1[mcIndex] = 2 * mcPrecision[mcIndex] / (mcPrecision[mcIndex] + 1)
+  
+  #random accuracy
+  expAccuracy = sum(p*q)
+  #kappa
+  kappa = (accuracy - expAccuracy) / (1 - expAccuracy)
+  
+  #random guess
+  rgAccuracy = 1 / nc
+  rgPrecision = p
+  rgRecall = 0*p + 1 / nc
+  rgF1 = 2 * p / (nc * p + 1)
+  
+  #rnd weighted
+  rwgAccurcy = sum(p^2)
+  rwgPrecision = p
+  rwgRecall = p
+  rwgF1 = p
+  
+  classNames = names(diag)
+  if(is.null(classNames)) classNames = paste("C",(1:nc),sep="")
+  
+  return(list(
+    ConfusionMatrix = cm,
+    Metrics = data.frame(
+      Class = classNames,
+      Accuracy = accuracy,
+      Precision = precision,
+      Recall = recall,
+      F1 = f1,
+      MacroAvgPrecision = macroPrecision,
+      MacroAvgRecall = macroRecall,
+      MacroAvgF1 = macroF1,
+      AvgAccuracy = avgAccuracy,
+      MicroAvgPrecision = microPrf,
+      MicroAvgRecall = microPrf,
+      MicroAvgF1 = microPrf,
+      MajorityClassAccuracy = mcAccuracy,
+      MajorityClassPrecision = mcPrecision,
+      MajorityClassRecall = mcRecall,
+      MajorityClassF1 = mcF1,
+      Kappa = kappa,
+      RandomGuessAccuracy = rgAccuracy,
+      RandomGuessPrecision = rgPrecision,
+      RandomGuessRecall = rgRecall,
+      RandomGuessF1 = rgF1,
+      RandomWeightedGuessAccurcy = rwgAccurcy,
+      RandomWeightedGuessPrecision = rwgPrecision,
+      RandomWeightedGuessRecall= rwgRecall,
+      RandomWeightedGuessWeightedF1 = rwgF1)))
+}
+}
+
+# evaluation metrics for first split
+
+pred_gbm1 <- as.data.frame(predict(gbm_model1, testingdata1, 
+                                   n.trees = 50,type = "response"))
+
+names(pred_gbm1) <- gsub(".50", "", names(pred_gbm1))
+pred_gbm1$failure <- as.factor(colnames(pred_gbm1)[max.col(pred_gbm1)])
+
+eval1 <- Evaluate(actual=testingdata1$failure,predicted=pred_gbm1$failure)
+eval1$ConfusionMatrix
+t(eval1$Metrics)
+
+# evaluation metrics for second split
+
+pred_gbm2 <- as.data.frame(predict(gbm_model2, testingdata2,  
+                                   n.trees = 50,type = "response"))
+
+names(pred_gbm2) <- gsub(".50", "", names(pred_gbm2))
+pred_gbm2$failure <- as.factor(colnames(pred_gbm2)[max.col(pred_gbm2)])
+
+eval2 <- Evaluate(actual=testingdata2$failure,predicted=pred_gbm2$failure)
+eval2$ConfusionMatrix
+t(eval2$Metrics)
+
+
+# evaluation metrics for third split
+
+pred_gbm3 <- as.data.frame(predict(gbm_model3, testingdata3,  
+                                   n.trees = 50,type = "response"))
+
+names(pred_gbm3)<-gsub(".50", "", names(pred_gbm3))
+pred_gbm3$failure <- as.factor(colnames(pred_gbm3)[max.col(pred_gbm3)])
+
+eval3 <- Evaluate(actual=testingdata3$failure,predicted=pred_gbm3$failure)
+eval3$ConfusionMatrix
+t(eval3$Metrics)
+
+# report the recall rates for the models
+
+rownames <- c("comp1","comp2","comp3","comp4","none")
+rownames
+data.frame(cbind(failure = rownames,
+                 gbm_model1_Recall = eval1$Metrics$Recall,
+                 gbm_model2_Recall = eval2$Metrics$Recall,
+                 gbm_model3_Recall = eval3$Metrics$Recall))
+
+#We will need to use Recall rates which is how the model will capture actual failures. As we see that the recall rates are well over
+#90% which translates that it will capture 90% of the failure correctly.
+
+# 	failure 	gbm_model1_Recall 	gbm_model2_Recall 	gbm_model3_Recall
+#1 	comp1 	0.916666666666667 	0.926470588235294 	0.928104575163399
+#2 	comp2 	0.938202247191011 	0.95983379501385 	  0.973684210526316
+#3 	comp3 	0.920673076923077 	0.940625 	          0.950892857142857
+#4 	comp4 	0.948630136986301 	0.928888888888889 	0.909937888198758
+#5 	none 	  0.999842106137916 	0.999833329861039 	0.999820565907522
+
+#Conclusion : To improve more on the rate we can increase the no. of iterations in the GBM but that would increase the 
+#computation powers.
